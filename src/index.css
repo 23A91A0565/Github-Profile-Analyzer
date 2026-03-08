@@ -1,0 +1,64 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Manrope:wght@400;500;700;800&family=Space+Grotesk:wght@500;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-soft: #eff6ff;
+  --bg-warm: #fdf4ff;
+  --ink: #0f172a;
+  --muted: #475569;
+  --accent: #2563eb;
+  --accent-alt: #c026d3;
+}
+
+.dark {
+  --bg-soft: #090f23;
+  --bg-warm: #22103d;
+  --ink: #e2e8f0;
+  --muted: #a5b4fc;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  color: var(--ink);
+  font-family: 'Manrope', sans-serif;
+  background:
+    radial-gradient(circle at 85% -5%, #bfdbfe 0, rgba(191, 219, 254, 0) 35%),
+    radial-gradient(circle at 10% 0%, #f5d0fe 0, rgba(245, 208, 254, 0) 40%),
+    linear-gradient(180deg, var(--bg-soft), var(--bg-warm));
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.glass {
+  background: rgba(255, 255, 255, 0.86);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  box-shadow: 0 10px 45px rgba(15, 23, 42, 0.08);
+}
+
+.dark .glass {
+  background: rgba(30, 27, 75, 0.58);
+  border-color: rgba(129, 140, 248, 0.4);
+  box-shadow: 0 16px 45px rgba(30, 41, 59, 0.55);
+}
+
+.section-card {
+  @apply glass rounded-2xl p-5 md:p-6;
+}
+
+.number-accent {
+  @apply font-mono tracking-tight;
+}

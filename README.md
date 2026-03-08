@@ -65,6 +65,7 @@ npm run build
 ## Notes
 
 - Repos/followers/events are fetched with pagination to improve completeness.
+- For faster UI response, events and followers analysis uses recent/sample windows by default, and follower detail lookups are kept lightweight in public mode.
 - localStorage caching is enabled for 15 minutes per query to speed repeated analyses and reduce API usage.
 - In UI, data source status indicates whether results came from live API or cache.
 - On GitHub rate limit (`403/429`), the app automatically waits briefly and retries before showing an error.

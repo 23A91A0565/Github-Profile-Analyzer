@@ -26,9 +26,13 @@ import { AnimatePresence, motion } from 'framer-motion'
 
 const githubToken = import.meta.env.VITE_GITHUB_TOKEN?.trim()
 const RUNTIME_TOKEN_KEY = 'ghpa:runtime-token'
+const RATE_LIMIT_UNTIL_KEY = 'ghpa:rate-limit-until'
+const RATE_LIMIT_LAST_PROBE_KEY = 'ghpa:rate-limit-last-probe'
+const RATE_LIMIT_PROBE_INTERVAL_MS = 15_000
 
 const api = axios.create({
   baseURL: 'https://api.github.com',
+  timeout: 12000,
   headers: {
     Accept: 'application/vnd.github+json',
     ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
@@ -64,6 +68,11 @@ function setRuntimeToken(token) {
 
   if (cleaned) {
     api.defaults.headers.Authorization = `Bearer ${cleaned}`
+    try {
+      localStorage.removeItem(RATE_LIMIT_UNTIL_KEY)
+    } catch {
+      // Ignore storage errors.
+    }
   } else if (githubToken) {
     api.defaults.headers.Authorization = `Bearer ${githubToken}`
   } else {
@@ -136,11 +145,59 @@ function writeCache(cacheKey, data) {
 
 function toErrorMessage(error) {
   if (error.message === 'Please provide a GitHub username.') return error.message
+  if (error.code === 'RATE_LIMIT_BLOCKED') return error.message
   if (error.response?.status === 404) return 'User not found. Check the GitHub username and try again.'
+  if (error.response?.status === 401) return 'Invalid GitHub token. Please update or clear token mode.'
   if (error.response?.status === 403 || error.response?.status === 429) {
     return 'GitHub API rate limit reached. Add token mode, or the app will auto-retry after a short wait.'
   }
   return 'Unable to fetch profile data right now.'
+}
+
+function getRateLimitUntil() {
+  try {
+    return Number(localStorage.getItem(RATE_LIMIT_UNTIL_KEY) || 0)
+  } catch {
+    return 0
+  }
+}
+
+function setRateLimitUntil(timestamp) {
+  try {
+    if (timestamp > Date.now()) {
+      localStorage.setItem(RATE_LIMIT_UNTIL_KEY, String(timestamp))
+    } else {
+      localStorage.removeItem(RATE_LIMIT_UNTIL_KEY)
+    }
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+function getRateLimitLastProbe() {
+  try {
+    return Number(localStorage.getItem(RATE_LIMIT_LAST_PROBE_KEY) || 0)
+  } catch {
+    return 0
+  }
+}
+
+function setRateLimitLastProbe(timestamp) {
+  try {
+    localStorage.setItem(RATE_LIMIT_LAST_PROBE_KEY, String(timestamp))
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+function createRateLimitBlockedError(resetAtMs) {
+  const remainingMs = Math.max(0, resetAtMs - Date.now())
+  const remainingSeconds = Math.ceil(remainingMs / 1000)
+  const error = new Error(
+    `GitHub API rate limit reached. Trying again in short intervals (~${Math.ceil(RATE_LIMIT_PROBE_INTERVAL_MS / 1000)}s probes). Estimated reset: ${remainingSeconds}s, or add token mode.`,
+  )
+  error.code = 'RATE_LIMIT_BLOCKED'
+  return error
 }
 
 function hasNextPage(linkHeader) {
@@ -175,8 +232,20 @@ async function fetchPaginated(path, { params = {}, perPage = 100, maxPages = 10 
   return items
 }
 
-async function requestWithRetry(config, { retries = 2 } = {}) {
+async function requestWithRetry(config, { retries = 4, maxWaitMs = 8000 } = {}) {
   let attempt = 0
+  const hasAuth = Boolean(api.defaults.headers.Authorization)
+
+  if (!hasAuth) {
+    const until = getRateLimitUntil()
+    if (until > Date.now()) {
+      const lastProbe = getRateLimitLastProbe()
+      if (Date.now() - lastProbe < RATE_LIMIT_PROBE_INTERVAL_MS) {
+        throw createRateLimitBlockedError(until)
+      }
+      setRateLimitLastProbe(Date.now())
+    }
+  }
 
   while (true) {
     try {
@@ -184,16 +253,27 @@ async function requestWithRetry(config, { retries = 2 } = {}) {
     } catch (error) {
       const status = error.response?.status
       const shouldRetry = status === 403 || status === 429
+      const remainingHeader = error.response?.headers?.['x-ratelimit-remaining']
+      const remaining = Number(remainingHeader)
+      const resetHeader = error.response?.headers?.['x-ratelimit-reset']
+      const resetEpochMs = Number(resetHeader) ? Number(resetHeader) * 1000 : 0
+      const untilResetMs = resetEpochMs ? Math.max(0, resetEpochMs - Date.now()) : 0
+      const exhausted = Number.isFinite(remaining) && remaining === 0 && resetEpochMs > Date.now()
+
+      if (!hasAuth && exhausted) {
+        setRateLimitUntil(resetEpochMs)
+
+        if (attempt >= retries) {
+          throw createRateLimitBlockedError(resetEpochMs)
+        }
+      }
 
       if (!shouldRetry || attempt >= retries) {
         throw error
       }
 
-      const resetHeader = error.response?.headers?.['x-ratelimit-reset']
-      const resetEpochMs = Number(resetHeader) ? Number(resetHeader) * 1000 : 0
-      const untilResetMs = resetEpochMs ? Math.max(0, resetEpochMs - Date.now()) : 0
       const backoffMs = 1200 * (attempt + 1)
-      const waitMs = Math.min(30_000, Math.max(untilResetMs, backoffMs))
+      const waitMs = Math.min(maxWaitMs, Math.max(untilResetMs, backoffMs))
 
       await sleep(waitMs)
       attempt += 1
@@ -467,21 +547,29 @@ async function fetchProfileBundle(username, includeFollowerDetails = true) {
     throw new Error('Please provide a GitHub username.')
   }
 
-  const [profileRes, repos, events, followers] = await Promise.all([
-    requestWithRetry({ url: `/users/${user}`, method: 'get' }),
-    fetchPaginated(`/users/${user}/repos`, { params: { sort: 'updated' }, perPage: 100, maxPages: 10 }),
-    fetchPaginated(`/users/${user}/events`, { perPage: 100, maxPages: 3 }),
-    fetchPaginated(`/users/${user}/followers`, { perPage: 100, maxPages: 4 }),
+  const profileRes = await requestWithRetry({ url: `/users/${user}`, method: 'get' })
+
+  // Keep analysis responsive by limiting deep pagination on first render.
+  const repoPages = Math.min(4, Math.max(1, Math.ceil((profileRes.data.public_repos || 0) / 100)))
+
+  const [repos, events, followers] = await Promise.all([
+    fetchPaginated(`/users/${user}/repos`, { params: { sort: 'updated' }, perPage: 100, maxPages: repoPages }),
+    fetchPaginated(`/users/${user}/events`, { perPage: 100, maxPages: 1 }),
+    fetchPaginated(`/users/${user}/followers`, { perPage: 100, maxPages: 1 }),
   ])
 
   let followerDetails = []
 
   if (includeFollowerDetails) {
-    const sampleFollowers = followers.slice(0, 12)
+    const sampleSize = githubToken || getStoredRuntimeToken() ? 12 : 6
+    const sampleFollowers = followers.slice(0, sampleSize)
     const details = await Promise.all(
       sampleFollowers.map(async (follower) => {
         try {
-          const response = await requestWithRetry({ url: `/users/${follower.login}`, method: 'get' }, { retries: 1 })
+          const response = await requestWithRetry(
+            { url: `/users/${follower.login}`, method: 'get' },
+            { retries: 0, maxWaitMs: 1500 },
+          )
           return response.data
         } catch {
           return null
@@ -745,16 +833,23 @@ function App() {
         <p className="mt-3 max-w-3xl text-sm text-slate-700 dark:text-indigo-200 md:text-base">
           Analyze profiles, detect developer skills, generate resume summaries, and compare growth with animated visualizations.
         </p>
-        <div className="mt-4 grid gap-2 md:grid-cols-[1fr_auto_auto]">
+        <form
+          className="mt-4 grid gap-2 md:grid-cols-[1fr_auto_auto]"
+          onSubmit={(e) => {
+            e.preventDefault()
+            saveRuntimeToken()
+          }}
+        >
           <input
             type="password"
             value={runtimeTokenInput}
             onChange={(e) => setRuntimeTokenInput(e.target.value)}
             placeholder="Paste GitHub token to enable higher rate limit"
+            autoComplete="off"
             className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs shadow-sm focus:border-blue-600 focus:outline-none dark:border-indigo-700 dark:bg-indigo-950 dark:text-indigo-50"
           />
           <button
-            type="button"
+            type="submit"
             onClick={saveRuntimeToken}
             className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-700 dark:bg-indigo-700 dark:hover:bg-indigo-600"
           >
@@ -767,7 +862,7 @@ function App() {
           >
             Clear Token
           </button>
-        </div>
+        </form>
       </header>
 
       <section className="section-card mb-8">

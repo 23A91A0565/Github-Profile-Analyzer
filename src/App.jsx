@@ -25,6 +25,7 @@ import { format, parseISO, subDays } from 'date-fns'
 import { AnimatePresence, motion } from 'framer-motion'
 
 const githubToken = import.meta.env.VITE_GITHUB_TOKEN?.trim()
+const RUNTIME_TOKEN_KEY = 'ghpa:runtime-token'
 
 const api = axios.create({
   baseURL: 'https://api.github.com',
@@ -33,6 +34,44 @@ const api = axios.create({
     ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
   },
 })
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+function getStoredRuntimeToken() {
+  try {
+    return localStorage.getItem(RUNTIME_TOKEN_KEY)?.trim() || ''
+  } catch {
+    return ''
+  }
+}
+
+function setRuntimeToken(token) {
+  const cleaned = token?.trim() || ''
+
+  try {
+    if (cleaned) {
+      localStorage.setItem(RUNTIME_TOKEN_KEY, cleaned)
+    } else {
+      localStorage.removeItem(RUNTIME_TOKEN_KEY)
+    }
+  } catch {
+    // Ignore storage errors.
+  }
+
+  if (cleaned) {
+    api.defaults.headers.Authorization = `Bearer ${cleaned}`
+  } else if (githubToken) {
+    api.defaults.headers.Authorization = `Bearer ${githubToken}`
+  } else {
+    delete api.defaults.headers.Authorization
+  }
+}
+
+setRuntimeToken(getStoredRuntimeToken())
 
 const chartPalette = ['#2563eb', '#c026d3', '#0ea5e9', '#8b5cf6', '#ec4899', '#06b6d4', '#6366f1']
 const CACHE_TTL_MS = 1000 * 60 * 15
@@ -98,7 +137,9 @@ function writeCache(cacheKey, data) {
 function toErrorMessage(error) {
   if (error.message === 'Please provide a GitHub username.') return error.message
   if (error.response?.status === 404) return 'User not found. Check the GitHub username and try again.'
-  if (error.response?.status === 403) return 'GitHub API rate limit reached. Add token mode or wait and retry.'
+  if (error.response?.status === 403 || error.response?.status === 429) {
+    return 'GitHub API rate limit reached. Add token mode, or the app will auto-retry after a short wait.'
+  }
   return 'Unable to fetch profile data right now.'
 }
 
@@ -112,7 +153,9 @@ async function fetchPaginated(path, { params = {}, perPage = 100, maxPages = 10 
   let items = []
 
   while (page <= maxPages) {
-    const response = await api.get(path, {
+    const response = await requestWithRetry({
+      url: path,
+      method: 'get',
       params: {
         ...params,
         page,
@@ -130,6 +173,32 @@ async function fetchPaginated(path, { params = {}, perPage = 100, maxPages = 10 
   }
 
   return items
+}
+
+async function requestWithRetry(config, { retries = 2 } = {}) {
+  let attempt = 0
+
+  while (true) {
+    try {
+      return await api.request(config)
+    } catch (error) {
+      const status = error.response?.status
+      const shouldRetry = status === 403 || status === 429
+
+      if (!shouldRetry || attempt >= retries) {
+        throw error
+      }
+
+      const resetHeader = error.response?.headers?.['x-ratelimit-reset']
+      const resetEpochMs = Number(resetHeader) ? Number(resetHeader) * 1000 : 0
+      const untilResetMs = resetEpochMs ? Math.max(0, resetEpochMs - Date.now()) : 0
+      const backoffMs = 1200 * (attempt + 1)
+      const waitMs = Math.min(30_000, Math.max(untilResetMs, backoffMs))
+
+      await sleep(waitMs)
+      attempt += 1
+    }
+  }
 }
 
 function createTimelineMap(events) {
@@ -399,7 +468,7 @@ async function fetchProfileBundle(username, includeFollowerDetails = true) {
   }
 
   const [profileRes, repos, events, followers] = await Promise.all([
-    api.get(`/users/${user}`),
+    requestWithRetry({ url: `/users/${user}`, method: 'get' }),
     fetchPaginated(`/users/${user}/repos`, { params: { sort: 'updated' }, perPage: 100, maxPages: 10 }),
     fetchPaginated(`/users/${user}/events`, { perPage: 100, maxPages: 3 }),
     fetchPaginated(`/users/${user}/followers`, { perPage: 100, maxPages: 4 }),
@@ -412,7 +481,7 @@ async function fetchProfileBundle(username, includeFollowerDetails = true) {
     const details = await Promise.all(
       sampleFollowers.map(async (follower) => {
         try {
-          const response = await api.get(`/users/${follower.login}`)
+          const response = await requestWithRetry({ url: `/users/${follower.login}`, method: 'get' }, { retries: 1 })
           return response.data
         } catch {
           return null
@@ -428,7 +497,7 @@ async function fetchProfileBundle(username, includeFollowerDetails = true) {
     repos,
     events,
     followers,
-    followerDetails,
+    followerDetails: followerDetails.length > 0 ? followerDetails : followers.slice(0, 12),
   }
 }
 
@@ -490,11 +559,24 @@ function App() {
   const [comparison, setComparison] = useState(null)
   const [dataSourceLabel, setDataSourceLabel] = useState('')
   const [theme, setTheme] = useState(() => localStorage.getItem('ghpa:theme') || 'light')
+  const [runtimeTokenInput, setRuntimeTokenInput] = useState(() => getStoredRuntimeToken())
+  const [tokenMode, setTokenMode] = useState(() => Boolean(getStoredRuntimeToken() || githubToken))
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark')
     localStorage.setItem('ghpa:theme', theme)
   }, [theme])
+
+  const saveRuntimeToken = () => {
+    setRuntimeToken(runtimeTokenInput)
+    setTokenMode(Boolean(runtimeTokenInput.trim() || githubToken))
+  }
+
+  const clearRuntimeToken = () => {
+    setRuntimeTokenInput('')
+    setRuntimeToken('')
+    setTokenMode(Boolean(githubToken))
+  }
 
   const compareMetrics = useMemo(() => {
     if (!comparison) return []
@@ -647,9 +729,7 @@ function App() {
             GitHub Profile Analyzer
           </p>
           <div className="flex items-center gap-2">
-            <p className="font-mono text-xs text-slate-600 dark:text-indigo-200">
-              GitHub API {githubToken ? '(token mode)' : '(public mode)'}
-            </p>
+            <p className="font-mono text-xs text-slate-600 dark:text-indigo-200">GitHub API {tokenMode ? '(token mode)' : '(public mode)'}</p>
             <button
               type="button"
               onClick={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
@@ -665,6 +745,29 @@ function App() {
         <p className="mt-3 max-w-3xl text-sm text-slate-700 dark:text-indigo-200 md:text-base">
           Analyze profiles, detect developer skills, generate resume summaries, and compare growth with animated visualizations.
         </p>
+        <div className="mt-4 grid gap-2 md:grid-cols-[1fr_auto_auto]">
+          <input
+            type="password"
+            value={runtimeTokenInput}
+            onChange={(e) => setRuntimeTokenInput(e.target.value)}
+            placeholder="Paste GitHub token to enable higher rate limit"
+            className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs shadow-sm focus:border-blue-600 focus:outline-none dark:border-indigo-700 dark:bg-indigo-950 dark:text-indigo-50"
+          />
+          <button
+            type="button"
+            onClick={saveRuntimeToken}
+            className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-700 dark:bg-indigo-700 dark:hover:bg-indigo-600"
+          >
+            Save Token
+          </button>
+          <button
+            type="button"
+            onClick={clearRuntimeToken}
+            className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-100 dark:border-indigo-700 dark:bg-indigo-900 dark:text-indigo-100 dark:hover:bg-indigo-800"
+          >
+            Clear Token
+          </button>
+        </div>
       </header>
 
       <section className="section-card mb-8">

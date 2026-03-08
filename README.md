@@ -9,7 +9,7 @@ A React dashboard that analyzes a full GitHub profile, not just one repository.
 - Language usage analysis: language distribution across repositories.
 - Contribution activity: commits, pull requests, issues, and timeline.
 - Repository activity: recent repositories with stars, forks, and open issues.
-- Followers analysis: top followers and location distribution (sampled details).
+- Followers analysis: top followers and location distribution (falls back gracefully when detail API calls are limited).
 - GitHub score: weighted score out of 100.
 - Recommendation engine: practical suggestion for profile/repo improvement.
 - Compare mode: user vs user metrics and language radar chart.
@@ -39,6 +39,8 @@ Then set:
 
 ```env
 VITE_GITHUB_TOKEN=your_token_here
+
+You can also paste a token directly in the app header using `Save Token` (stored in localStorage) and remove it with `Clear Token`.
 ```
 
 3. Run development server:
@@ -65,3 +67,4 @@ npm run build
 - Repos/followers/events are fetched with pagination to improve completeness.
 - localStorage caching is enabled for 15 minutes per query to speed repeated analyses and reduce API usage.
 - In UI, data source status indicates whether results came from live API or cache.
+- On GitHub rate limit (`403/429`), the app automatically waits briefly and retries before showing an error.
